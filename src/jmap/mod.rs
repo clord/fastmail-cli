@@ -528,6 +528,14 @@ impl JmapClient {
 
     pub async fn find_mailbox(&mut self, name: &str) -> Result<Mailbox> {
         let mailboxes = self.list_mailboxes().await?;
+
+        // A "Parent/Child" path is resolved by walking the parentId chain, so
+        // sub-mailboxes that share a leaf name (e.g. Personal/Receipts and
+        // Ranch/Receipts) can be addressed unambiguously by name.
+        if name.contains('/') {
+            return Self::resolve_mailbox_path(&mailboxes, name);
+        }
+
         let name_lower = name.to_lowercase();
 
         if let Some(m) = mailboxes
@@ -545,6 +553,26 @@ impl JmapClient {
         }
 
         Err(Error::MailboxNotFound(name.into()))
+    }
+
+    /// Resolve a slash-separated mailbox path (`Parent/Child/...`) by matching
+    /// each segment against children of the previously matched mailbox. Empty
+    /// segments (from leading/trailing/double slashes) are ignored.
+    fn resolve_mailbox_path(mailboxes: &[Mailbox], path: &str) -> Result<Mailbox> {
+        let mut parent_id: Option<String> = None;
+        let mut current: Option<Mailbox> = None;
+
+        for seg in path.split('/').filter(|s| !s.is_empty()) {
+            let seg_lower = seg.to_lowercase();
+            let found = mailboxes
+                .iter()
+                .find(|m| m.name.to_lowercase() == seg_lower && m.parent_id == parent_id)
+                .ok_or_else(|| Error::MailboxNotFound(path.to_string()))?;
+            parent_id = Some(found.id.clone());
+            current = Some(found.clone());
+        }
+
+        current.ok_or_else(|| Error::MailboxNotFound(path.to_string()))
     }
 
     #[instrument(skip(self))]
@@ -1003,18 +1031,33 @@ impl JmapClient {
 
     #[instrument(skip(self))]
     pub async fn move_email(&self, email_id: &str, mailbox_id: &str) -> Result<()> {
+        self.move_emails(std::slice::from_ref(&email_id.to_string()), mailbox_id)
+            .await
+    }
+
+    /// Move one or more emails into `mailbox_id` in a single Email/set request.
+    /// Each email's mailboxIds is replaced (a move, not a copy).
+    #[instrument(skip(self))]
+    pub async fn move_emails(&self, email_ids: &[String], mailbox_id: &str) -> Result<()> {
+        if email_ids.is_empty() {
+            return Ok(());
+        }
         let account_id = self.account_id()?;
+
+        let mut update = serde_json::Map::new();
+        for id in email_ids {
+            update.insert(
+                id.clone(),
+                json!({ "mailboxIds": { (mailbox_id): true } }),
+            );
+        }
 
         let responses = self
             .request(vec![json!([
                 "Email/set",
                 {
                     "accountId": account_id,
-                    "update": {
-                        (email_id): {
-                            "mailboxIds": { (mailbox_id): true }
-                        }
-                    }
+                    "update": Value::Object(update)
                 },
                 "m0"
             ])])
@@ -1024,7 +1067,7 @@ impl JmapClient {
             Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/set")?;
 
         if let Some(ref not_updated) = resp.not_updated
-            && let Some(err) = not_updated.get(email_id)
+            && let Some((email_id, err)) = not_updated.iter().next()
         {
             let error_type = err
                 .get("type")
@@ -1036,6 +1079,128 @@ impl JmapClient {
                 .unwrap_or("Failed to move email");
             return Err(Error::Jmap {
                 method: "Email/set".into(),
+                error_type: error_type.into(),
+                description: format!("{email_id}: {description}"),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Create a new mailbox (folder). `parent_id` of `None` creates a top-level
+    /// mailbox. Returns the created mailbox with its server-assigned id.
+    #[instrument(skip(self))]
+    pub async fn create_mailbox(&self, name: &str, parent_id: Option<&str>) -> Result<Mailbox> {
+        let account_id = self.account_id()?;
+
+        let responses = self
+            .request(vec![json!([
+                "Mailbox/set",
+                {
+                    "accountId": account_id,
+                    "create": {
+                        "new": { "name": name, "parentId": parent_id }
+                    }
+                },
+                "mb0"
+            ])])
+            .await?;
+
+        #[derive(Deserialize)]
+        struct MailboxSetResponse {
+            created: Option<HashMap<String, Value>>,
+            #[serde(rename = "notCreated")]
+            not_created: Option<HashMap<String, Value>>,
+        }
+
+        let resp: MailboxSetResponse =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Mailbox/set")?;
+
+        if let Some(ref not_created) = resp.not_created
+            && let Some(err) = not_created.get("new")
+        {
+            let error_type = err
+                .get("type")
+                .and_then(|v: &Value| v.as_str())
+                .unwrap_or("unknown");
+            let description = err
+                .get("description")
+                .and_then(|v: &Value| v.as_str())
+                .unwrap_or("Failed to create mailbox");
+            return Err(Error::Jmap {
+                method: "Mailbox/set".into(),
+                error_type: error_type.into(),
+                description: description.into(),
+            });
+        }
+
+        // The server only echoes back the properties it set (notably `id`),
+        // so build the returned Mailbox from the known inputs plus that id.
+        let id = resp
+            .created
+            .as_ref()
+            .and_then(|c| c.get("new"))
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Jmap {
+                method: "Mailbox/set".into(),
+                error_type: "unknown".into(),
+                description: "No mailbox ID returned".into(),
+            })?;
+
+        Ok(Mailbox {
+            id: id.to_string(),
+            name: name.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            role: None,
+            total_emails: 0,
+            unread_emails: 0,
+            total_threads: 0,
+            unread_threads: 0,
+            sort_order: 0,
+        })
+    }
+
+    /// Delete a mailbox by id. With `remove_emails = false` the call fails if
+    /// the mailbox still contains messages, so nothing is destroyed by accident.
+    #[instrument(skip(self))]
+    pub async fn delete_mailbox(&self, mailbox_id: &str, remove_emails: bool) -> Result<()> {
+        let account_id = self.account_id()?;
+
+        let responses = self
+            .request(vec![json!([
+                "Mailbox/set",
+                {
+                    "accountId": account_id,
+                    "onDestroyRemoveEmails": remove_emails,
+                    "destroy": [mailbox_id]
+                },
+                "mb0"
+            ])])
+            .await?;
+
+        #[derive(Deserialize)]
+        struct MailboxDestroyResponse {
+            #[serde(rename = "notDestroyed")]
+            not_destroyed: Option<HashMap<String, Value>>,
+        }
+
+        let resp: MailboxDestroyResponse =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Mailbox/set")?;
+
+        if let Some(ref not_destroyed) = resp.not_destroyed
+            && let Some(err) = not_destroyed.get(mailbox_id)
+        {
+            let error_type = err
+                .get("type")
+                .and_then(|v: &Value| v.as_str())
+                .unwrap_or("unknown");
+            let description = err
+                .get("description")
+                .and_then(|v: &Value| v.as_str())
+                .unwrap_or("Failed to delete mailbox");
+            return Err(Error::Jmap {
+                method: "Mailbox/set".into(),
                 error_type: error_type.into(),
                 description: description.into(),
             });

@@ -185,14 +185,19 @@ enum Commands {
         attachments: Vec<String>,
     },
 
-    /// Move email to a mailbox
+    /// Move one or more emails to a mailbox
     Move {
-        /// Email ID
-        email_id: String,
+        /// Email ID(s)
+        #[arg(required = true, num_args = 1..)]
+        email_ids: Vec<String>,
 
-        /// Destination mailbox name
-        #[arg(long)]
-        to: String,
+        /// Destination mailbox name (or `Parent/Child` path)
+        #[arg(long, conflicts_with = "to_id")]
+        to: Option<String>,
+
+        /// Destination mailbox id (unambiguous when leaf names repeat)
+        #[arg(long = "to-id", conflicts_with = "to")]
+        to_id: Option<String>,
     },
 
     /// Mark email as spam
@@ -324,6 +329,10 @@ enum Commands {
         shell: Shell,
     },
 
+    /// Manage mailboxes (folders)
+    #[command(subcommand)]
+    Mailbox(MailboxCommands),
+
     /// Manage masked email addresses
     #[command(subcommand)]
     Masked(MaskedCommands),
@@ -334,6 +343,36 @@ enum Commands {
 
     /// Run as MCP (Model Context Protocol) server for Claude integration
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum MailboxCommands {
+    /// List mailboxes (folders)
+    List,
+
+    /// Create a new mailbox (folder)
+    Create {
+        /// Mailbox name
+        name: String,
+
+        /// Parent mailbox id (omit for a top-level mailbox)
+        #[arg(long)]
+        parent: Option<String>,
+    },
+
+    /// Delete a mailbox by id
+    Delete {
+        /// Mailbox id
+        id: String,
+
+        /// Also delete any emails it contains (otherwise the call fails if non-empty)
+        #[arg(long)]
+        remove_emails: bool,
+
+        /// Skip confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -578,7 +617,11 @@ async fn main() {
             .await
         }
 
-        Commands::Move { email_id, to } => commands::move_email(&email_id, &to).await,
+        Commands::Move {
+            email_ids,
+            to,
+            to_id,
+        } => commands::move_email(&email_ids, to.as_deref(), to_id.as_deref()).await,
 
         Commands::Spam { email_id, yes } => {
             if !yes {
@@ -668,6 +711,24 @@ async fn main() {
             );
             return;
         }
+
+        Commands::Mailbox(cmd) => match cmd {
+            MailboxCommands::List => commands::list_mailboxes().await,
+            MailboxCommands::Create { name, parent } => {
+                commands::create_mailbox(&name, parent.as_deref()).await
+            }
+            MailboxCommands::Delete {
+                id,
+                remove_emails,
+                yes,
+            } => {
+                if !yes {
+                    eprintln!("Delete mailbox {}? Use -y to confirm.", id);
+                    std::process::exit(1);
+                }
+                commands::delete_mailbox(&id, remove_emails).await
+            }
+        },
 
         Commands::Masked(cmd) => match cmd {
             MaskedCommands::List => commands::list_masked_emails().await,
