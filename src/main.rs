@@ -7,7 +7,7 @@ mod mcp;
 mod models;
 pub mod util;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use models::Output;
 use std::io;
@@ -46,6 +46,132 @@ struct Cli {
     command: Commands,
 }
 
+/// Base search-filter flags shared by every filter-aware command. The keyword
+/// presence/absence selectors live in `KeywordSelectArgs` so the `flag`
+/// command (whose own `--keyword` action flag would otherwise collide) can
+/// flatten the base without them.
+#[derive(Args, Debug, Clone)]
+struct BaseFilterArgs {
+    /// Full-text search (from, to, cc, bcc, subject, body)
+    #[arg(short, long)]
+    text: Option<String>,
+
+    /// Filter by From header (substring match)
+    #[arg(long)]
+    from: Option<String>,
+
+    /// Filter by exact sender domain (subdomains excluded)
+    #[arg(long)]
+    from_domain: Option<String>,
+
+    /// Filter by To header
+    #[arg(long)]
+    to: Option<String>,
+
+    /// Filter by Cc header
+    #[arg(long)]
+    cc: Option<String>,
+
+    /// Filter by Bcc header
+    #[arg(long)]
+    bcc: Option<String>,
+
+    /// Filter by Subject
+    #[arg(long)]
+    subject: Option<String>,
+
+    /// Filter by body content
+    #[arg(long)]
+    body: Option<String>,
+
+    /// Filter by mailbox name
+    #[arg(short, long)]
+    mailbox: Option<String>,
+
+    /// Only emails with attachments
+    #[arg(long)]
+    has_attachment: bool,
+
+    /// Minimum email size in bytes
+    #[arg(long)]
+    min_size: Option<u32>,
+
+    /// Maximum email size in bytes
+    #[arg(long)]
+    max_size: Option<u32>,
+
+    /// Emails received before date (ISO 8601, e.g., 2024-01-01)
+    #[arg(long)]
+    before: Option<String>,
+
+    /// Emails received on or after date (ISO 8601, e.g., 2024-01-01)
+    #[arg(long)]
+    after: Option<String>,
+
+    /// Only unread emails
+    #[arg(long)]
+    unread: bool,
+
+    /// Only flagged/starred emails
+    #[arg(long)]
+    flagged: bool,
+}
+
+/// Keyword presence/absence selectors. Kept separate so `flag` can reuse the
+/// base filter without colliding with its own `--keyword` action flag.
+#[derive(Args, Debug, Clone, Default)]
+struct KeywordSelectArgs {
+    /// Require this keyword to be present (repeatable)
+    #[arg(long = "keyword", action = clap::ArgAction::Append)]
+    keyword: Vec<String>,
+
+    /// Require this keyword to be absent (repeatable)
+    #[arg(long = "not-keyword", action = clap::ArgAction::Append)]
+    not_keyword: Vec<String>,
+}
+
+/// Full reusable search-filter flags, flattened into `search`, `move`, `spam`,
+/// and `delete`. Single source of truth converting into
+/// `commands::SearchFilter`.
+#[derive(Args, Debug, Clone)]
+struct FilterArgs {
+    #[command(flatten)]
+    base: BaseFilterArgs,
+    #[command(flatten)]
+    keywords: KeywordSelectArgs,
+}
+
+impl BaseFilterArgs {
+    fn into_filter(self, keywords: KeywordSelectArgs) -> commands::SearchFilter {
+        commands::SearchFilter {
+            text: self.text,
+            from: self.from,
+            to: self.to,
+            cc: self.cc,
+            bcc: self.bcc,
+            subject: self.subject,
+            body: self.body,
+            mailbox: self.mailbox,
+            has_attachment: self.has_attachment,
+            min_size: self.min_size,
+            max_size: self.max_size,
+            before: self.before,
+            after: self.after,
+            unread: self.unread,
+            flagged: self.flagged,
+            from_domain: self.from_domain,
+            keyword: keywords.keyword,
+            not_keyword: keywords.not_keyword,
+        }
+    }
+}
+
+impl From<FilterArgs> for commands::SearchFilter {
+    fn from(a: FilterArgs) -> Self {
+        a.base.into_filter(a.keywords)
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Authenticate with Fastmail API token
@@ -63,79 +189,53 @@ enum Commands {
     Get {
         /// Email ID
         email_id: String,
+
+        /// Output format: json (default, full Email envelope), text (clean
+        /// plain text body), or html (raw HTML body). text/html print raw to
+        /// stdout for piping.
+        #[arg(long, value_enum, default_value_t = commands::GetFormat::Json)]
+        format: commands::GetFormat,
     },
 
     /// Get all emails in a thread/conversation
     Thread {
         /// Email ID (will fetch entire thread this email belongs to)
         email_id: String,
+
+        /// Only output the From of the most recent message in the thread
+        #[arg(long)]
+        last_sender: bool,
+
+        /// Output format: json (default, full thread) or digest (compact
+        /// plain-text summary block, printed raw to stdout)
+        #[arg(long, value_enum, default_value_t = commands::ThreadFormat::Json, conflicts_with = "last_sender")]
+        format: commands::ThreadFormat,
     },
 
     /// Search emails with JMAP filters
     Search {
-        /// Full-text search (from, to, cc, bcc, subject, body)
-        #[arg(short, long)]
-        text: Option<String>,
-
-        /// Filter by From header
-        #[arg(long)]
-        from: Option<String>,
-
-        /// Filter by To header
-        #[arg(long)]
-        to: Option<String>,
-
-        /// Filter by Cc header
-        #[arg(long)]
-        cc: Option<String>,
-
-        /// Filter by Bcc header
-        #[arg(long)]
-        bcc: Option<String>,
-
-        /// Filter by Subject
-        #[arg(long)]
-        subject: Option<String>,
-
-        /// Filter by body content
-        #[arg(long)]
-        body: Option<String>,
-
-        /// Filter by mailbox name
-        #[arg(short, long)]
-        mailbox: Option<String>,
-
-        /// Only emails with attachments
-        #[arg(long)]
-        has_attachment: bool,
-
-        /// Minimum email size in bytes
-        #[arg(long)]
-        min_size: Option<u32>,
-
-        /// Maximum email size in bytes
-        #[arg(long)]
-        max_size: Option<u32>,
-
-        /// Emails received before date (ISO 8601, e.g., 2024-01-01)
-        #[arg(long)]
-        before: Option<String>,
-
-        /// Emails received on or after date (ISO 8601, e.g., 2024-01-01)
-        #[arg(long)]
-        after: Option<String>,
-
-        /// Only unread emails
-        #[arg(long)]
-        unread: bool,
-
-        /// Only flagged/starred emails
-        #[arg(long)]
-        flagged: bool,
+        #[command(flatten)]
+        filter: FilterArgs,
 
         /// Maximum results
         #[arg(short, long, default_value = "50")]
         limit: u32,
+
+        /// Result offset (position) for paging
+        #[arg(long, default_value = "0")]
+        offset: u32,
+
+        /// Comma-separated top-level fields to keep (e.g. id,subject,from)
+        #[arg(long)]
+        fields: Option<String>,
+
+        /// Emit one compact JSON object per line (for piping)
+        #[arg(long)]
+        jsonl: bool,
+
+        /// Incremental sync: return changes since this Email state token
+        #[arg(long)]
+        since: Option<String>,
     },
 
     /// Send an email
@@ -173,32 +273,63 @@ enum Commands {
         draft: bool,
 
         /// HTML body content
-        #[arg(long, conflicts_with = "html_file")]
+        #[arg(long, conflicts_with = "html_file", conflicts_with = "markdown")]
         html_body: Option<String>,
 
         /// Path to HTML file for email body
-        #[arg(long, conflicts_with = "html_body")]
+        #[arg(long, conflicts_with = "html_body", conflicts_with = "markdown")]
         html_file: Option<String>,
+
+        /// Treat --body as Markdown: render it to HTML for the HTML body while
+        /// keeping the Markdown as the plain-text body.
+        #[arg(long, conflicts_with = "html_body", conflicts_with = "html_file")]
+        markdown: bool,
 
         /// File attachment (repeatable)
         #[arg(long = "attachment", short = 'a', action = clap::ArgAction::Append)]
         attachments: Vec<String>,
     },
 
-    /// Move email to a mailbox
+    /// Move emails to a mailbox (by id(s) or by search filter)
     Move {
-        /// Email ID
-        email_id: String,
+        /// Email ID(s) to move; omit to select targets via filter flags
+        ids: Vec<String>,
 
-        /// Destination mailbox name
+        /// Destination mailbox by name (use --to-id for an explicit id)
+        #[arg(long = "to-mailbox", visible_alias = "to-name")]
+        to_mailbox: Option<String>,
+
+        /// Destination mailbox id
         #[arg(long)]
-        to: String,
+        to_id: Option<String>,
+
+        #[command(flatten)]
+        filter: FilterArgs,
+
+        /// Maximum targets to resolve from a filter
+        #[arg(short, long, default_value = "50")]
+        limit: u32,
+
+        /// Show would-be-affected emails and action without mutating
+        #[arg(long)]
+        dry_run: bool,
     },
 
-    /// Mark email as spam
+    /// Mark emails as spam (by id(s) or by search filter)
     Spam {
-        /// Email ID
-        email_id: String,
+        /// Email ID(s) to mark; omit to select targets via filter flags
+        ids: Vec<String>,
+
+        #[command(flatten)]
+        filter: FilterArgs,
+
+        /// Maximum targets to resolve from a filter
+        #[arg(short, long, default_value = "50")]
+        limit: u32,
+
+        /// Show would-be-affected emails and action without mutating
+        #[arg(long)]
+        dry_run: bool,
 
         /// Skip confirmation
         #[arg(short = 'y', long)]
@@ -324,6 +455,10 @@ enum Commands {
         shell: Shell,
     },
 
+    /// Manage mailboxes (folders)
+    #[command(subcommand)]
+    Mailbox(MailboxCommands),
+
     /// Manage masked email addresses
     #[command(subcommand)]
     Masked(MaskedCommands),
@@ -332,8 +467,119 @@ enum Commands {
     #[command(subcommand)]
     Contacts(ContactsCommands),
 
+    /// Delete emails: move to Trash, or permanently destroy with --hard
+    /// (by id(s) or by search filter)
+    Delete {
+        /// Email ID(s) to delete; omit to select targets via filter flags
+        ids: Vec<String>,
+
+        #[command(flatten)]
+        filter: FilterArgs,
+
+        /// Maximum targets to resolve from a filter
+        #[arg(short, long, default_value = "50")]
+        limit: u32,
+
+        /// Permanently destroy instead of moving to Trash (irreversible)
+        #[arg(long)]
+        hard: bool,
+
+        /// Show would-be-affected emails and action without mutating
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// Add or remove keywords on emails (by id(s) or by search filter)
+    Flag {
+        /// Email ID(s) to flag; omit to select targets via filter flags
+        ids: Vec<String>,
+
+        /// Keyword to add (or remove with --remove); repeatable
+        #[arg(long = "keyword", action = clap::ArgAction::Append)]
+        keywords: Vec<String>,
+
+        /// Remove the listed keywords instead of adding them
+        #[arg(long)]
+        remove: bool,
+
+        // Note: the base filter is flattened WITHOUT the keyword selectors,
+        // since `flag`'s own `--keyword` action flag occupies that name.
+        #[command(flatten)]
+        filter: BaseFilterArgs,
+
+        /// Maximum targets to resolve from a filter
+        #[arg(short, long, default_value = "50")]
+        limit: u32,
+
+        /// Show would-be-affected emails and action without mutating
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Extract hyperlinks (anchor text + URL) from an email, with tracking
+    /// redirects stripped
+    Links {
+        /// Email ID
+        email_id: String,
+    },
+
+    /// Check whether the latest message in a thread was sent by one of my identities
+    Replied {
+        /// Email ID (will fetch the thread this email belongs to)
+        email_id: String,
+    },
+
+    /// Export the raw RFC 5322 message to a file (e.g. for archival)
+    Export {
+        /// Email ID
+        email_id: String,
+
+        /// Destination: a directory (trailing `/` or existing dir) or an
+        /// exact file path. Defaults to the current directory.
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Export format (only eml today)
+        #[arg(long, value_enum, default_value_t = commands::ExportFormat::Eml)]
+        format: commands::ExportFormat,
+    },
+
     /// Run as MCP (Model Context Protocol) server for Claude integration
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum MailboxCommands {
+    /// List mailboxes (folders)
+    List,
+
+    /// Create a new mailbox (folder)
+    Create {
+        /// Mailbox name
+        name: String,
+
+        /// Parent mailbox id (omit for a top-level mailbox)
+        #[arg(long)]
+        parent: Option<String>,
+    },
+
+    /// Delete a mailbox by id
+    Delete {
+        /// Mailbox id
+        id: String,
+
+        /// Also delete any emails it contains (otherwise the call fails if non-empty)
+        #[arg(long)]
+        remove_emails: bool,
+
+        /// Skip confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -393,6 +639,18 @@ enum ListCommands {
         /// Maximum results
         #[arg(short, long, default_value = "50")]
         limit: u32,
+
+        /// Result offset (position) for paging
+        #[arg(long, default_value = "0")]
+        offset: u32,
+
+        /// Comma-separated top-level fields to keep (e.g. id,subject,from)
+        #[arg(long)]
+        fields: Option<String>,
+
+        /// Emit one compact JSON object per line (for piping)
+        #[arg(long)]
+        jsonl: bool,
     },
 
     /// List sender identities (for use with --from)
@@ -408,6 +666,12 @@ enum ContactsCommands {
     Search {
         /// Search query
         query: String,
+    },
+
+    /// Check whether an email address belongs to a known contact
+    IsKnown {
+        /// Email address to look up
+        email: String,
     },
 
     /// Create a new contact
@@ -501,54 +765,38 @@ async fn main() {
 
         Commands::List(cmd) => match cmd {
             ListCommands::Mailboxes => commands::list_mailboxes().await,
-            ListCommands::Emails { mailbox, limit } => commands::list_emails(&mailbox, limit).await,
+            ListCommands::Emails {
+                mailbox,
+                limit,
+                offset,
+                fields,
+                jsonl,
+            } => commands::list_emails(&mailbox, limit, offset, fields, jsonl).await,
             ListCommands::Identities => commands::list_identities().await,
         },
 
-        Commands::Get { email_id } => commands::get_email(&email_id).await,
+        Commands::Get { email_id, format } => commands::get_email_fmt(&email_id, format).await,
 
-        Commands::Thread { email_id } => commands::get_thread(&email_id).await,
+        Commands::Thread {
+            email_id,
+            last_sender,
+            format,
+        } => {
+            if last_sender {
+                commands::thread_last_sender(&email_id).await
+            } else {
+                commands::get_thread_fmt(&email_id, format).await
+            }
+        }
 
         Commands::Search {
-            text,
-            from,
-            to,
-            cc,
-            bcc,
-            subject,
-            body,
-            mailbox,
-            has_attachment,
-            min_size,
-            max_size,
-            before,
-            after,
-            unread,
-            flagged,
+            filter,
             limit,
-        } => {
-            commands::search(
-                commands::SearchFilter {
-                    text,
-                    from,
-                    to,
-                    cc,
-                    bcc,
-                    subject,
-                    body,
-                    mailbox,
-                    has_attachment,
-                    min_size,
-                    max_size,
-                    before,
-                    after,
-                    unread,
-                    flagged,
-                },
-                limit,
-            )
-            .await
-        }
+            offset,
+            fields,
+            jsonl,
+            since,
+        } => commands::search(filter.into(), limit, offset, fields, jsonl, since).await,
 
         Commands::Send {
             to,
@@ -561,9 +809,17 @@ async fn main() {
             draft,
             html_body,
             html_file,
+            markdown,
             attachments,
         } => {
             async {
+                // When --markdown is set, render the Markdown --body to HTML and
+                // use it as the HTML body; the Markdown stays as the text body.
+                let html_body = if markdown {
+                    Some(util::markdown_to_html(&body))
+                } else {
+                    html_body
+                };
                 let params = build_compose_params(
                     cc.as_deref(),
                     bcc.as_deref(),
@@ -578,14 +834,27 @@ async fn main() {
             .await
         }
 
-        Commands::Move { email_id, to } => commands::move_email(&email_id, &to).await,
+        Commands::Move {
+            ids,
+            to_mailbox,
+            to_id,
+            filter,
+            limit,
+            dry_run,
+        } => commands::move_bulk(ids, filter.into(), to_mailbox, to_id, limit, dry_run).await,
 
-        Commands::Spam { email_id, yes } => {
-            if !yes {
-                eprintln!("Mark email {} as spam? Use -y to confirm.", email_id);
+        Commands::Spam {
+            ids,
+            filter,
+            limit,
+            dry_run,
+            yes,
+        } => {
+            if !dry_run && !yes {
+                eprintln!("Mark email(s) as spam? Use -y to confirm (or --dry-run to preview).");
                 std::process::exit(1);
             }
-            commands::mark_spam(&email_id).await
+            commands::spam_bulk(ids, filter.into(), limit, dry_run).await
         }
 
         Commands::MarkRead { email_id, unread } => commands::mark_read(&email_id, !unread).await,
@@ -669,6 +938,24 @@ async fn main() {
             return;
         }
 
+        Commands::Mailbox(cmd) => match cmd {
+            MailboxCommands::List => commands::list_mailboxes().await,
+            MailboxCommands::Create { name, parent } => {
+                commands::create_mailbox(&name, parent.as_deref()).await
+            }
+            MailboxCommands::Delete {
+                id,
+                remove_emails,
+                yes,
+            } => {
+                if !yes {
+                    eprintln!("Delete mailbox {}? Use -y to confirm.", id);
+                    std::process::exit(1);
+                }
+                commands::delete_mailbox(&id, remove_emails).await
+            }
+        },
+
         Commands::Masked(cmd) => match cmd {
             MaskedCommands::List => commands::list_masked_emails().await,
             MaskedCommands::Create {
@@ -697,6 +984,7 @@ async fn main() {
         Commands::Contacts(cmd) => match cmd {
             ContactsCommands::List => commands::list_contacts().await,
             ContactsCommands::Search { query } => commands::search_contacts(&query).await,
+            ContactsCommands::IsKnown { email } => commands::contacts_is_known(&email).await,
             ContactsCommands::Create {
                 name,
                 email,
@@ -743,6 +1031,50 @@ async fn main() {
                 commands::delete_contact(&contact_id).await
             }
         },
+
+        Commands::Delete {
+            ids,
+            filter,
+            limit,
+            hard,
+            dry_run,
+            yes,
+        } => {
+            if !dry_run && !yes {
+                eprintln!(
+                    "Delete email(s)? Use -y to confirm (or --dry-run to preview).{}",
+                    if hard {
+                        " (--hard is irreversible)"
+                    } else {
+                        ""
+                    }
+                );
+                std::process::exit(1);
+            }
+            commands::delete_bulk(ids, filter.into(), limit, hard, dry_run).await
+        }
+
+        Commands::Flag {
+            ids,
+            keywords,
+            remove,
+            filter,
+            limit,
+            dry_run,
+        } => {
+            let search_filter = filter.into_filter(KeywordSelectArgs::default());
+            commands::flag_bulk(ids, search_filter, keywords, remove, limit, dry_run).await
+        }
+
+        Commands::Links { email_id } => commands::extract_email_links(&email_id).await,
+
+        Commands::Replied { email_id } => commands::replied(&email_id).await,
+
+        Commands::Export {
+            email_id,
+            output,
+            format,
+        } => commands::export_email(&email_id, output.as_deref(), format).await,
 
         Commands::Mcp => mcp::run_server().await,
     };

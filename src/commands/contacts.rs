@@ -1,4 +1,4 @@
-use crate::carddav::{CardDavClient, ContactEmail, ContactFields, ContactPhone};
+use crate::carddav::{CardDavClient, Contact, ContactEmail, ContactFields, ContactPhone};
 use crate::config::Config;
 use crate::models::Output;
 
@@ -61,6 +61,25 @@ pub async fn search_contacts(query: &str) -> anyhow::Result<()> {
     let contacts = client.search_contacts(query).await?;
 
     Output::success(contacts).print();
+    Ok(())
+}
+
+/// Check whether an email address belongs to a known contact.
+pub async fn contacts_is_known(email: &str) -> anyhow::Result<()> {
+    let client = make_carddav_client()?;
+    let contact = client.find_by_email(email).await?;
+
+    #[derive(serde::Serialize)]
+    struct IsKnownResponse {
+        known: bool,
+        contact: Option<Contact>,
+    }
+
+    Output::success(IsKnownResponse {
+        known: contact.is_some(),
+        contact,
+    })
+    .print();
     Ok(())
 }
 

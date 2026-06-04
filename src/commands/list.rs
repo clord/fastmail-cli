@@ -1,5 +1,6 @@
+use crate::commands::SearchFilter;
 use crate::jmap::authenticated_client;
-use crate::models::{Email, Mailbox, Output};
+use crate::models::{Output, emails_to_values, parse_fields, print_emails_jsonl};
 
 pub async fn list_mailboxes() -> anyhow::Result<()> {
     let mut client = authenticated_client().await?;
@@ -10,19 +11,38 @@ pub async fn list_mailboxes() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn list_emails(mailbox: &str, limit: u32) -> anyhow::Result<()> {
+pub async fn list_emails(
+    mailbox: &str,
+    limit: u32,
+    offset: u32,
+    fields: Option<String>,
+    jsonl: bool,
+) -> anyhow::Result<()> {
     let mut client = authenticated_client().await?;
 
     let mailbox = client.find_mailbox(mailbox).await?;
-    let emails = client.list_emails(&mailbox.id, limit).await?;
+    // Use the filtered search path so we get paging + state + total metadata.
+    let filter = SearchFilter::default();
+    let result = client
+        .search_emails_filtered(&filter, Some(&mailbox.id), limit, offset)
+        .await?;
+    let fields = parse_fields(fields.as_deref());
+    let checkpoint = client.current_email_state().await?;
 
-    #[derive(serde::Serialize)]
-    struct EmailListResponse {
-        mailbox: Mailbox,
-        emails: Vec<Email>,
+    if jsonl {
+        print_emails_jsonl(&result.emails, fields.as_deref(), Some(&checkpoint));
+    } else {
+        let values = emails_to_values(&result.emails, fields.as_deref());
+        Output::success(serde_json::json!({
+            "mailbox": mailbox,
+            "state": checkpoint,
+            "queryState": result.state,
+            "total": result.total,
+            "position": result.position,
+            "emails": values,
+        }))
+        .print();
     }
-
-    Output::success(EmailListResponse { mailbox, emails }).print();
 
     Ok(())
 }

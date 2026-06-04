@@ -201,10 +201,65 @@ impl ComposeContext {
     }
 }
 
+/// Result of a filtered email search: the emails plus paging/state metadata.
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub emails: Vec<Email>,
+    /// The Email/query state token (queryState) for checkpointing.
+    pub state: String,
+    /// Total matching emails (from `calculateTotal`), if the server reported it.
+    pub total: Option<u64>,
+    /// The position (offset) of the first returned id within the full result.
+    pub position: u64,
+}
+
+/// Result of draining Email/changes since a given state.
+#[derive(Debug, Clone, Default)]
+pub struct EmailChanges {
+    pub new_state: String,
+    pub created: Vec<Email>,
+    pub updated: Vec<Email>,
+    pub destroyed: Vec<String>,
+    pub has_more_changes: bool,
+}
+
+// Raw Email/query response (subset we care about).
+#[derive(Deserialize)]
+struct QueryResponse {
+    ids: Vec<String>,
+    #[serde(rename = "queryState")]
+    query_state: String,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    position: u64,
+}
+
+// Raw Email/changes response.
+#[derive(Deserialize)]
+struct ChangesResponse {
+    #[serde(rename = "newState")]
+    new_state: String,
+    #[serde(default)]
+    created: Vec<String>,
+    #[serde(default)]
+    updated: Vec<String>,
+    #[serde(default)]
+    destroyed: Vec<String>,
+    #[serde(rename = "hasMoreChanges", default)]
+    has_more_changes: bool,
+}
+
 // Shared JMAP response types used across multiple methods
 #[derive(Deserialize)]
 struct GetResponse<T> {
     list: Vec<T>,
+}
+
+// Email/get response carrying the collection state token (for checkpointing).
+#[derive(Deserialize)]
+struct GetStateResponse {
+    state: String,
 }
 
 #[derive(Deserialize)]
@@ -353,6 +408,116 @@ pub fn expand_reply_recipients(
 fn dedup_by_email(addrs: &mut Vec<EmailAddress>) {
     let mut seen = std::collections::HashSet::<String>::new();
     addrs.retain(|a| seen.insert(a.email.to_lowercase()));
+}
+
+/// Normalize a date filter value to an ISO 8601 UTC timestamp. A bare date
+/// (`2024-01-01`) gains a `T00:00:00Z` suffix; anything containing `T` is
+/// passed through unchanged.
+fn normalize_date(value: &str) -> String {
+    if value.contains('T') {
+        value.to_string()
+    } else {
+        format!("{value}T00:00:00Z")
+    }
+}
+
+/// Build the list of leaf FilterCondition objects for a search.
+///
+/// Each entry is a single-condition JMAP object. Because a JMAP
+/// FilterCondition allows only ONE `hasKeyword` and ONE `notKeyword`, every
+/// keyword (including the `$seen`/`$flagged` derived from `--unread`/
+/// `--flagged`) is emitted as its own leaf so they can be AND-composed by
+/// [`compose_filter`]. The exact-domain `from_domain` is NOT included here —
+/// it is applied as a post-filter by the caller — though callers may still
+/// add a coarse `from` prefilter separately.
+fn build_filter_leaves(filter: &SearchFilter, mailbox_id: Option<&str>) -> Vec<Value> {
+    let mut leaves: Vec<Value> = Vec::new();
+
+    if let Some(ref text) = filter.text {
+        leaves.push(json!({ "text": text }));
+    }
+    if let Some(ref from) = filter.from {
+        leaves.push(json!({ "from": from }));
+    }
+    if let Some(ref to) = filter.to {
+        leaves.push(json!({ "to": to }));
+    }
+    if let Some(ref cc) = filter.cc {
+        leaves.push(json!({ "cc": cc }));
+    }
+    if let Some(ref bcc) = filter.bcc {
+        leaves.push(json!({ "bcc": bcc }));
+    }
+    if let Some(ref subject) = filter.subject {
+        leaves.push(json!({ "subject": subject }));
+    }
+    if let Some(ref body) = filter.body {
+        leaves.push(json!({ "body": body }));
+    }
+    if let Some(mailbox) = mailbox_id {
+        leaves.push(json!({ "inMailbox": mailbox }));
+    }
+    if filter.has_attachment {
+        leaves.push(json!({ "hasAttachment": true }));
+    }
+    if let Some(min_size) = filter.min_size {
+        leaves.push(json!({ "minSize": min_size }));
+    }
+    if let Some(max_size) = filter.max_size {
+        leaves.push(json!({ "maxSize": max_size }));
+    }
+    if let Some(ref before) = filter.before {
+        leaves.push(json!({ "before": normalize_date(before) }));
+    }
+    if let Some(ref after) = filter.after {
+        leaves.push(json!({ "after": normalize_date(after) }));
+    }
+    if filter.unread {
+        leaves.push(json!({ "notKeyword": "$seen" }));
+    }
+    if filter.flagged {
+        leaves.push(json!({ "hasKeyword": "$flagged" }));
+    }
+    for kw in &filter.keyword {
+        leaves.push(json!({ "hasKeyword": kw }));
+    }
+    for kw in &filter.not_keyword {
+        leaves.push(json!({ "notKeyword": kw }));
+    }
+
+    leaves
+}
+
+/// Compose leaf FilterConditions into a single JMAP filter value:
+/// - zero leaves → empty object `{}` (match all)
+/// - one leaf    → that leaf directly
+/// - many leaves → `{ operator: "AND", conditions: [...] }`
+fn compose_filter(leaves: Vec<Value>) -> Value {
+    match leaves.len() {
+        0 => json!({}),
+        1 => leaves.into_iter().next().unwrap(),
+        _ => json!({ "operator": "AND", "conditions": leaves }),
+    }
+}
+
+/// Compute the new keyword map for an email given a set of keywords to add or
+/// remove. Starts from the email's CURRENT keywords so unrelated keywords are
+/// never clobbered. When `remove` is true the listed keywords are removed;
+/// otherwise they are added (set to `true`). Returns the resulting map.
+pub fn compute_keyword_update(
+    current: &HashMap<String, bool>,
+    keywords: &[String],
+    remove: bool,
+) -> HashMap<String, bool> {
+    let mut map = current.clone();
+    for kw in keywords {
+        if remove {
+            map.remove(kw);
+        } else {
+            map.insert(kw.clone(), true);
+        }
+    }
+    map
 }
 
 impl JmapClient {
@@ -528,6 +693,14 @@ impl JmapClient {
 
     pub async fn find_mailbox(&mut self, name: &str) -> Result<Mailbox> {
         let mailboxes = self.list_mailboxes().await?;
+
+        // A "Parent/Child" path is resolved by walking the parentId chain, so
+        // sub-mailboxes that share a leaf name (e.g. Personal/Receipts and
+        // Ranch/Receipts) can be addressed unambiguously by name.
+        if name.contains('/') {
+            return Self::resolve_mailbox_path(&mailboxes, name);
+        }
+
         let name_lower = name.to_lowercase();
 
         if let Some(m) = mailboxes
@@ -547,46 +720,24 @@ impl JmapClient {
         Err(Error::MailboxNotFound(name.into()))
     }
 
-    #[instrument(skip(self))]
-    pub async fn list_emails(&self, mailbox_id: &str, limit: u32) -> Result<Vec<Email>> {
-        let account_id = self.account_id()?;
+    /// Resolve a slash-separated mailbox path (`Parent/Child/...`) by matching
+    /// each segment against children of the previously matched mailbox. Empty
+    /// segments (from leading/trailing/double slashes) are ignored.
+    fn resolve_mailbox_path(mailboxes: &[Mailbox], path: &str) -> Result<Mailbox> {
+        let mut parent_id: Option<String> = None;
+        let mut current: Option<Mailbox> = None;
 
-        let responses = self
-            .request(vec![
-                json!([
-                    "Email/query",
-                    {
-                        "accountId": account_id,
-                        "filter": { "inMailbox": mailbox_id },
-                        "sort": [{"property": "receivedAt", "isAscending": false}],
-                        "limit": limit
-                    },
-                    "q0"
-                ]),
-                json!([
-                    "Email/get",
-                    {
-                        "accountId": account_id,
-                        "#ids": {
-                            "resultOf": "q0",
-                            "name": "Email/query",
-                            "path": "/ids"
-                        },
-                        "properties": [
-                            "id", "threadId", "mailboxIds", "keywords",
-                            "size", "receivedAt", "from", "to", "cc",
-                            "subject", "preview", "hasAttachment"
-                        ]
-                    },
-                    "g0"
-                ]),
-            ])
-            .await?;
+        for seg in path.split('/').filter(|s| !s.is_empty()) {
+            let seg_lower = seg.to_lowercase();
+            let found = mailboxes
+                .iter()
+                .find(|m| m.name.to_lowercase() == seg_lower && m.parent_id == parent_id)
+                .ok_or_else(|| Error::MailboxNotFound(path.to_string()))?;
+            parent_id = Some(found.id.clone());
+            current = Some(found.clone());
+        }
 
-        let resp: GetResponse<Email> =
-            Self::parse_response(responses.get(1).unwrap_or(&Value::Null), "Email/get")?;
-
-        Ok(resp.list)
+        current.ok_or_else(|| Error::MailboxNotFound(path.to_string()))
     }
 
     #[instrument(skip(self))]
@@ -689,75 +840,20 @@ impl JmapClient {
         Ok(resp.list)
     }
 
-    /// Search emails with full JMAP filter support
+    /// Search emails with full JMAP filter support.
+    ///
+    /// Returns the matching emails plus paging/state metadata so callers can
+    /// page large mailboxes and checkpoint for incremental sync.
     #[instrument(skip(self, filter))]
     pub async fn search_emails_filtered(
         &self,
         filter: &SearchFilter,
         mailbox_id: Option<&str>,
         limit: u32,
-    ) -> Result<Vec<Email>> {
+        offset: u32,
+    ) -> Result<SearchResult> {
         let account_id = self.account_id()?;
-
-        // Build JMAP filter object
-        let mut jmap_filter = json!({});
-
-        if let Some(ref text) = filter.text {
-            jmap_filter["text"] = json!(text);
-        }
-        if let Some(ref from) = filter.from {
-            jmap_filter["from"] = json!(from);
-        }
-        if let Some(ref to) = filter.to {
-            jmap_filter["to"] = json!(to);
-        }
-        if let Some(ref cc) = filter.cc {
-            jmap_filter["cc"] = json!(cc);
-        }
-        if let Some(ref bcc) = filter.bcc {
-            jmap_filter["bcc"] = json!(bcc);
-        }
-        if let Some(ref subject) = filter.subject {
-            jmap_filter["subject"] = json!(subject);
-        }
-        if let Some(ref body) = filter.body {
-            jmap_filter["body"] = json!(body);
-        }
-        if let Some(mailbox) = mailbox_id {
-            jmap_filter["inMailbox"] = json!(mailbox);
-        }
-        if filter.has_attachment {
-            jmap_filter["hasAttachment"] = json!(true);
-        }
-        if let Some(min_size) = filter.min_size {
-            jmap_filter["minSize"] = json!(min_size);
-        }
-        if let Some(max_size) = filter.max_size {
-            jmap_filter["maxSize"] = json!(max_size);
-        }
-        if let Some(ref before) = filter.before {
-            // Normalize date to ISO 8601 if needed
-            let date = if before.contains('T') {
-                before.clone()
-            } else {
-                format!("{}T00:00:00Z", before)
-            };
-            jmap_filter["before"] = json!(date);
-        }
-        if let Some(ref after) = filter.after {
-            let date = if after.contains('T') {
-                after.clone()
-            } else {
-                format!("{}T00:00:00Z", after)
-            };
-            jmap_filter["after"] = json!(date);
-        }
-        if filter.unread {
-            jmap_filter["notKeyword"] = json!("$seen");
-        }
-        if filter.flagged {
-            jmap_filter["hasKeyword"] = json!("$flagged");
-        }
+        let jmap_filter = compose_filter(build_filter_leaves(filter, mailbox_id));
 
         let responses = self
             .request(vec![
@@ -767,7 +863,9 @@ impl JmapClient {
                         "accountId": account_id,
                         "filter": jmap_filter,
                         "sort": [{"property": "receivedAt", "isAscending": false}],
-                        "limit": limit
+                        "position": offset,
+                        "limit": limit,
+                        "calculateTotal": true
                     },
                     "q0"
                 ]),
@@ -791,10 +889,234 @@ impl JmapClient {
             ])
             .await?;
 
+        let query_resp: QueryResponse =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/query")?;
         let resp: GetResponse<Email> =
             Self::parse_response(responses.get(1).unwrap_or(&Value::Null), "Email/get")?;
 
-        Ok(resp.list)
+        // Email/get returns results in an arbitrary order; preserve query order.
+        let mut by_id: HashMap<String, Email> =
+            resp.list.into_iter().map(|e| (e.id.clone(), e)).collect();
+        let emails: Vec<Email> = query_resp
+            .ids
+            .iter()
+            .filter_map(|id| by_id.remove(id))
+            .collect();
+
+        Ok(SearchResult {
+            emails,
+            state: query_resp.query_state,
+            total: query_resp.total,
+            position: query_resp.position,
+        })
+    }
+
+    /// Fetch emails by id with the standard "search" property set, preserving
+    /// the input order. Used by incremental sync to materialize changed ids.
+    #[instrument(skip(self, ids))]
+    async fn get_emails_summary(&self, ids: &[String]) -> Result<Vec<Email>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let account_id = self.account_id()?;
+        let responses = self
+            .request(vec![json!([
+                "Email/get",
+                {
+                    "accountId": account_id,
+                    "ids": ids,
+                    "properties": [
+                        "id", "threadId", "mailboxIds", "keywords",
+                        "size", "receivedAt", "from", "to", "cc",
+                        "subject", "preview", "hasAttachment"
+                    ]
+                },
+                "g0"
+            ])])
+            .await?;
+
+        let resp: GetResponse<Email> =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/get")?;
+        let mut by_id: HashMap<String, Email> =
+            resp.list.into_iter().map(|e| (e.id.clone(), e)).collect();
+        Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+    }
+
+    /// Return the current Email collection `state` token (for checkpointing /
+    /// incremental sync). Calls `Email/get` with empty `ids`.
+    #[instrument(skip(self))]
+    pub async fn current_email_state(&self) -> Result<String> {
+        let account_id = self.account_id()?;
+        let responses = self
+            .request(vec![json!([
+                "Email/get",
+                { "accountId": account_id, "ids": [], "properties": ["id"] },
+                "g0"
+            ])])
+            .await?;
+        let resp: GetStateResponse =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/get")?;
+        Ok(resp.state)
+    }
+
+    /// Fetch a single batch of Email/changes since `since_state`. The returned
+    /// `created`/`updated` are materialized to full Email summaries; the
+    /// `has_more_changes`/`new_state` let callers loop to drain everything.
+    #[instrument(skip(self))]
+    pub async fn email_changes(&self, since_state: &str) -> Result<EmailChanges> {
+        let account_id = self.account_id()?;
+        let responses = self
+            .request(vec![json!([
+                "Email/changes",
+                {
+                    "accountId": account_id,
+                    "sinceState": since_state,
+                    "maxChanges": 256
+                },
+                "c0"
+            ])])
+            .await?;
+
+        let resp: ChangesResponse =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/changes")?;
+
+        let created = self.get_emails_summary(&resp.created).await?;
+        let updated = self.get_emails_summary(&resp.updated).await?;
+
+        Ok(EmailChanges {
+            new_state: resp.new_state,
+            created,
+            updated,
+            destroyed: resp.destroyed,
+            has_more_changes: resp.has_more_changes,
+        })
+    }
+
+    /// Drain ALL Email/changes since `since_state`, looping on
+    /// `hasMoreChanges`, accumulating created/updated/destroyed and returning
+    /// the final state token.
+    #[instrument(skip(self))]
+    pub async fn drain_email_changes(&self, since_state: &str) -> Result<EmailChanges> {
+        let mut state = since_state.to_string();
+        let mut acc = EmailChanges {
+            new_state: state.clone(),
+            ..Default::default()
+        };
+        loop {
+            let batch = self.email_changes(&state).await?;
+            acc.created.extend(batch.created);
+            acc.updated.extend(batch.updated);
+            acc.destroyed.extend(batch.destroyed);
+            acc.new_state = batch.new_state.clone();
+            state = batch.new_state;
+            if !batch.has_more_changes {
+                break;
+            }
+        }
+        Ok(acc)
+    }
+
+    /// Move emails to the Trash ("Deleted Messages") mailbox. This is a soft
+    /// delete — it relocates rather than destroying. Resolves the trash
+    /// mailbox by role `trash` (falling back to common names).
+    #[instrument(skip(self, ids))]
+    pub async fn delete_emails(&mut self, ids: &[String]) -> Result<()> {
+        let trash = self.find_trash_mailbox().await?;
+        let account_id = self.account_id()?;
+
+        let mut update = serde_json::Map::new();
+        for id in ids {
+            update.insert(
+                id.clone(),
+                json!({ "mailboxIds": { trash.id.clone(): true } }),
+            );
+        }
+
+        let responses = self
+            .request(vec![json!([
+                "Email/set",
+                { "accountId": account_id, "update": Value::Object(update) },
+                "d0"
+            ])])
+            .await?;
+
+        let resp: SetResponse =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/set")?;
+        Self::check_not_updated(&resp, "Failed to move email to Trash")
+    }
+
+    /// Permanently destroy emails via `Email/set` `destroy`. Irreversible.
+    #[instrument(skip(self, ids))]
+    pub async fn destroy_emails(&self, ids: &[String]) -> Result<()> {
+        let account_id = self.account_id()?;
+        let responses = self
+            .request(vec![json!([
+                "Email/set",
+                { "accountId": account_id, "destroy": ids },
+                "d0"
+            ])])
+            .await?;
+
+        #[derive(Deserialize)]
+        struct DestroyResponse {
+            #[serde(rename = "notDestroyed")]
+            not_destroyed: Option<HashMap<String, Value>>,
+        }
+        let resp: DestroyResponse =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/set")?;
+        if let Some(ref not_destroyed) = resp.not_destroyed
+            && let Some((id, err)) = not_destroyed.iter().next()
+        {
+            let description = err
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Failed to destroy email");
+            return Err(Error::Jmap {
+                method: "Email/set".into(),
+                error_type: "notDestroyed".into(),
+                description: format!("{id}: {description}"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Resolve the Trash mailbox by role `trash`, then by common names.
+    async fn find_trash_mailbox(&mut self) -> Result<Mailbox> {
+        let mailboxes = self.list_mailboxes().await?;
+        if let Some(m) = mailboxes
+            .iter()
+            .find(|m| m.role.as_deref() == Some("trash"))
+        {
+            return Ok(m.clone());
+        }
+        for name in ["Trash", "Deleted Messages", "Deleted Items"] {
+            if let Some(m) = mailboxes.iter().find(|m| m.name.eq_ignore_ascii_case(name)) {
+                return Ok(m.clone());
+            }
+        }
+        Err(Error::MailboxNotFound("Trash".into()))
+    }
+
+    /// Helper: return an error if a SetResponse reported any notUpdated entries.
+    fn check_not_updated(resp: &SetResponse, default_desc: &str) -> Result<()> {
+        if let Some(ref not_updated) = resp.not_updated
+            && let Some((id, err)) = not_updated.iter().next()
+        {
+            let error_type = err
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let description = err
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or(default_desc);
+            return Err(Error::Jmap {
+                method: "Email/set".into(),
+                error_type: error_type.into(),
+                description: format!("{id}: {description}"),
+            });
+        }
+        Ok(())
     }
 
     #[instrument(skip(self))]
@@ -1003,18 +1325,30 @@ impl JmapClient {
 
     #[instrument(skip(self))]
     pub async fn move_email(&self, email_id: &str, mailbox_id: &str) -> Result<()> {
+        self.move_emails(std::slice::from_ref(&email_id.to_string()), mailbox_id)
+            .await
+    }
+
+    /// Move one or more emails into `mailbox_id` in a single Email/set request.
+    /// Each email's mailboxIds is replaced (a move, not a copy).
+    #[instrument(skip(self))]
+    pub async fn move_emails(&self, email_ids: &[String], mailbox_id: &str) -> Result<()> {
+        if email_ids.is_empty() {
+            return Ok(());
+        }
         let account_id = self.account_id()?;
+
+        let mut update = serde_json::Map::new();
+        for id in email_ids {
+            update.insert(id.clone(), json!({ "mailboxIds": { (mailbox_id): true } }));
+        }
 
         let responses = self
             .request(vec![json!([
                 "Email/set",
                 {
                     "accountId": account_id,
-                    "update": {
-                        (email_id): {
-                            "mailboxIds": { (mailbox_id): true }
-                        }
-                    }
+                    "update": Value::Object(update)
                 },
                 "m0"
             ])])
@@ -1024,7 +1358,7 @@ impl JmapClient {
             Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/set")?;
 
         if let Some(ref not_updated) = resp.not_updated
-            && let Some(err) = not_updated.get(email_id)
+            && let Some((email_id, err)) = not_updated.iter().next()
         {
             let error_type = err
                 .get("type")
@@ -1036,6 +1370,128 @@ impl JmapClient {
                 .unwrap_or("Failed to move email");
             return Err(Error::Jmap {
                 method: "Email/set".into(),
+                error_type: error_type.into(),
+                description: format!("{email_id}: {description}"),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Create a new mailbox (folder). `parent_id` of `None` creates a top-level
+    /// mailbox. Returns the created mailbox with its server-assigned id.
+    #[instrument(skip(self))]
+    pub async fn create_mailbox(&self, name: &str, parent_id: Option<&str>) -> Result<Mailbox> {
+        let account_id = self.account_id()?;
+
+        let responses = self
+            .request(vec![json!([
+                "Mailbox/set",
+                {
+                    "accountId": account_id,
+                    "create": {
+                        "new": { "name": name, "parentId": parent_id }
+                    }
+                },
+                "mb0"
+            ])])
+            .await?;
+
+        #[derive(Deserialize)]
+        struct MailboxSetResponse {
+            created: Option<HashMap<String, Value>>,
+            #[serde(rename = "notCreated")]
+            not_created: Option<HashMap<String, Value>>,
+        }
+
+        let resp: MailboxSetResponse =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Mailbox/set")?;
+
+        if let Some(ref not_created) = resp.not_created
+            && let Some(err) = not_created.get("new")
+        {
+            let error_type = err
+                .get("type")
+                .and_then(|v: &Value| v.as_str())
+                .unwrap_or("unknown");
+            let description = err
+                .get("description")
+                .and_then(|v: &Value| v.as_str())
+                .unwrap_or("Failed to create mailbox");
+            return Err(Error::Jmap {
+                method: "Mailbox/set".into(),
+                error_type: error_type.into(),
+                description: description.into(),
+            });
+        }
+
+        // The server only echoes back the properties it set (notably `id`),
+        // so build the returned Mailbox from the known inputs plus that id.
+        let id = resp
+            .created
+            .as_ref()
+            .and_then(|c| c.get("new"))
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Jmap {
+                method: "Mailbox/set".into(),
+                error_type: "unknown".into(),
+                description: "No mailbox ID returned".into(),
+            })?;
+
+        Ok(Mailbox {
+            id: id.to_string(),
+            name: name.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            role: None,
+            total_emails: 0,
+            unread_emails: 0,
+            total_threads: 0,
+            unread_threads: 0,
+            sort_order: 0,
+        })
+    }
+
+    /// Delete a mailbox by id. With `remove_emails = false` the call fails if
+    /// the mailbox still contains messages, so nothing is destroyed by accident.
+    #[instrument(skip(self))]
+    pub async fn delete_mailbox(&self, mailbox_id: &str, remove_emails: bool) -> Result<()> {
+        let account_id = self.account_id()?;
+
+        let responses = self
+            .request(vec![json!([
+                "Mailbox/set",
+                {
+                    "accountId": account_id,
+                    "onDestroyRemoveEmails": remove_emails,
+                    "destroy": [mailbox_id]
+                },
+                "mb0"
+            ])])
+            .await?;
+
+        #[derive(Deserialize)]
+        struct MailboxDestroyResponse {
+            #[serde(rename = "notDestroyed")]
+            not_destroyed: Option<HashMap<String, Value>>,
+        }
+
+        let resp: MailboxDestroyResponse =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Mailbox/set")?;
+
+        if let Some(ref not_destroyed) = resp.not_destroyed
+            && let Some(err) = not_destroyed.get(mailbox_id)
+        {
+            let error_type = err
+                .get("type")
+                .and_then(|v: &Value| v.as_str())
+                .unwrap_or("unknown");
+            let description = err
+                .get("description")
+                .and_then(|v: &Value| v.as_str())
+                .unwrap_or("Failed to delete mailbox");
+            return Err(Error::Jmap {
+                method: "Mailbox/set".into(),
                 error_type: error_type.into(),
                 description: description.into(),
             });
@@ -1469,6 +1925,108 @@ mod tests {
             event_source_url: None,
             state: None,
         }
+    }
+
+    // ============ Filter composition tests ============
+
+    #[test]
+    fn test_compose_filter_zero_leaves_is_empty_object() {
+        assert_eq!(compose_filter(vec![]), json!({}));
+    }
+
+    #[test]
+    fn test_compose_filter_single_leaf_passes_through() {
+        let leaf = json!({ "from": "alice@x.com" });
+        assert_eq!(compose_filter(vec![leaf.clone()]), leaf);
+    }
+
+    #[test]
+    fn test_compose_filter_multiple_leaves_wraps_in_and() {
+        let leaves = vec![json!({ "from": "a" }), json!({ "subject": "b" })];
+        let composed = compose_filter(leaves.clone());
+        assert_eq!(composed["operator"], "AND");
+        assert_eq!(composed["conditions"], json!(leaves));
+    }
+
+    #[test]
+    fn test_build_filter_leaves_preserves_existing_behavior() {
+        let filter = SearchFilter {
+            from: Some("alice@x.com".into()),
+            unread: true,
+            flagged: true,
+            ..Default::default()
+        };
+        let leaves = build_filter_leaves(&filter, Some("MB1"));
+        // from, inMailbox, notKeyword $seen, hasKeyword $flagged
+        assert_eq!(leaves.len(), 4);
+        assert!(leaves.contains(&json!({ "from": "alice@x.com" })));
+        assert!(leaves.contains(&json!({ "inMailbox": "MB1" })));
+        assert!(leaves.contains(&json!({ "notKeyword": "$seen" })));
+        assert!(leaves.contains(&json!({ "hasKeyword": "$flagged" })));
+    }
+
+    #[test]
+    fn test_build_filter_leaves_multiple_keywords() {
+        let filter = SearchFilter {
+            keyword: vec!["a".into(), "b".into()],
+            not_keyword: vec!["c".into()],
+            ..Default::default()
+        };
+        let leaves = build_filter_leaves(&filter, None);
+        assert_eq!(leaves.len(), 3);
+        assert!(leaves.contains(&json!({ "hasKeyword": "a" })));
+        assert!(leaves.contains(&json!({ "hasKeyword": "b" })));
+        assert!(leaves.contains(&json!({ "notKeyword": "c" })));
+    }
+
+    #[test]
+    fn test_build_filter_leaves_empty_yields_match_all() {
+        let filter = SearchFilter::default();
+        assert!(build_filter_leaves(&filter, None).is_empty());
+        assert_eq!(
+            compose_filter(build_filter_leaves(&filter, None)),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn test_build_filter_leaves_normalizes_dates() {
+        let filter = SearchFilter {
+            before: Some("2026-05-09".into()),
+            after: Some("2026-01-01T12:00:00Z".into()),
+            ..Default::default()
+        };
+        let leaves = build_filter_leaves(&filter, None);
+        assert!(leaves.contains(&json!({ "before": "2026-05-09T00:00:00Z" })));
+        assert!(leaves.contains(&json!({ "after": "2026-01-01T12:00:00Z" })));
+    }
+
+    // ============ Keyword update tests ============
+
+    #[test]
+    fn test_compute_keyword_add_preserves_existing() {
+        let mut current = HashMap::new();
+        current.insert("$seen".to_string(), true);
+        let out = compute_keyword_update(&current, &["custom".into()], false);
+        assert_eq!(out.get("$seen"), Some(&true));
+        assert_eq!(out.get("custom"), Some(&true));
+    }
+
+    #[test]
+    fn test_compute_keyword_remove_only_listed() {
+        let mut current = HashMap::new();
+        current.insert("$seen".to_string(), true);
+        current.insert("custom".to_string(), true);
+        let out = compute_keyword_update(&current, &["custom".into()], true);
+        assert_eq!(out.get("$seen"), Some(&true));
+        assert!(!out.contains_key("custom"));
+    }
+
+    #[test]
+    fn test_compute_keyword_remove_absent_is_noop() {
+        let current = HashMap::new();
+        let out = compute_keyword_update(&current, &["nope".into()], true);
+        assert!(out.is_empty());
     }
 
     #[test]

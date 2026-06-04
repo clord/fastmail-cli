@@ -38,7 +38,11 @@ impl QueryRoot {
         let mut client = client.lock().await;
         let limit = limit.unwrap_or(25).min(100);
         let mb = client.find_mailbox(&mailbox).await?;
-        let emails = client.list_emails(&mb.id, limit).await?;
+        let filter = crate::commands::SearchFilter::default();
+        let emails = client
+            .search_emails_filtered(&filter, Some(&mb.id), limit, 0)
+            .await?
+            .emails;
         Ok(emails.into_iter().map(Into::into).collect())
     }
 
@@ -103,17 +107,14 @@ impl QueryRoot {
             from,
             to,
             cc,
-            bcc: None,
             subject,
             body,
-            mailbox: None,
             has_attachment: has_attachment.unwrap_or(false),
-            min_size: None,
-            max_size: None,
             before,
             after,
             unread: unread.unwrap_or(false),
             flagged: flagged.unwrap_or(false),
+            ..Default::default()
         };
 
         let mailbox_id = if let Some(ref name) = mailbox {
@@ -123,8 +124,9 @@ impl QueryRoot {
         };
 
         let emails = client
-            .search_emails_filtered(&filter, mailbox_id.as_deref(), limit)
-            .await?;
+            .search_emails_filtered(&filter, mailbox_id.as_deref(), limit, 0)
+            .await?
+            .emails;
         Ok(emails.into_iter().map(Into::into).collect())
     }
 

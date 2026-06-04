@@ -360,10 +360,113 @@ pub fn resolve_html(
     Ok(None)
 }
 
+// ============ Markdown & HTML conversion ============
+
+/// Render Markdown source to an HTML fragment.
+///
+/// Used by `send --markdown` to produce an HTML body from a Markdown `--body`.
+pub fn markdown_to_html(md: &str) -> String {
+    use pulldown_cmark::{Options, Parser, html};
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let parser = Parser::new_ext(md, options);
+    let mut out = String::new();
+    html::push_html(&mut out, parser);
+    out
+}
+
+/// Convert an HTML document/fragment to clean plain text.
+///
+/// Used by `get --format text` when an email only has an HTML body.
+pub fn html_to_text(html: &str) -> String {
+    // A generous wrap width keeps lines from being aggressively re-wrapped,
+    // which matters when piping into other tools.
+    html2text::from_read(html.as_bytes(), 100)
+        .unwrap_or_default()
+        .trim_end()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_markdown_to_html_heading() {
+        let html = markdown_to_html("# Hello");
+        assert!(html.contains("<h1>Hello</h1>"), "got: {html}");
+    }
+
+    #[test]
+    fn test_markdown_to_html_bold() {
+        let html = markdown_to_html("This is **bold** text");
+        assert!(html.contains("<strong>bold</strong>"), "got: {html}");
+    }
+
+    #[test]
+    fn test_markdown_to_html_link() {
+        let html = markdown_to_html("[Example](https://example.com)");
+        assert!(
+            html.contains("<a href=\"https://example.com\">Example</a>"),
+            "got: {html}"
+        );
+    }
+
+    #[test]
+    fn test_markdown_to_html_unordered_list() {
+        let html = markdown_to_html("- one\n- two\n- three");
+        assert!(html.contains("<ul>"), "got: {html}");
+        assert!(html.contains("<li>one</li>"), "got: {html}");
+        assert!(html.contains("<li>three</li>"), "got: {html}");
+    }
+
+    #[test]
+    fn test_markdown_to_html_ordered_list() {
+        let html = markdown_to_html("1. first\n2. second");
+        assert!(html.contains("<ol>"), "got: {html}");
+        assert!(html.contains("<li>first</li>"), "got: {html}");
+    }
+
+    #[test]
+    fn test_markdown_to_html_inline_code() {
+        let html = markdown_to_html("Use `cargo build` to compile");
+        assert!(html.contains("<code>cargo build</code>"), "got: {html}");
+    }
+
+    #[test]
+    fn test_markdown_to_html_code_block() {
+        let html = markdown_to_html("```\nlet x = 1;\n```");
+        assert!(html.contains("<pre><code>"), "got: {html}");
+        assert!(html.contains("let x = 1;"), "got: {html}");
+    }
+
+    #[test]
+    fn test_html_to_text_basic() {
+        let text = html_to_text("<h1>Title</h1><p>Hello <b>world</b></p>");
+        assert!(text.contains("Title"), "got: {text:?}");
+        assert!(text.contains("Hello"), "got: {text:?}");
+        assert!(text.contains("world"), "got: {text:?}");
+        // No HTML tags should survive.
+        assert!(!text.contains('<'), "got: {text:?}");
+    }
+
+    #[test]
+    fn test_html_to_text_links_inlined() {
+        let text = html_to_text("<p>See <a href=\"https://example.com\">site</a></p>");
+        assert!(text.contains("site"), "got: {text:?}");
+        assert!(!text.contains('<'), "got: {text:?}");
+    }
+
+    #[test]
+    fn test_html_to_text_empty() {
+        assert_eq!(html_to_text(""), "");
+    }
 
     #[test]
     fn test_resolve_html_inline() {
