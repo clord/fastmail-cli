@@ -273,6 +273,21 @@ impl CardDavClient {
         Ok(filtered)
     }
 
+    /// Find a contact by an exact (case-insensitive) email address.
+    /// Iterates all address books + contacts, returns the first match.
+    pub async fn find_by_email(&self, email: &str) -> Result<Option<Contact>> {
+        let addressbooks = self.list_addressbooks().await?;
+
+        for ab in addressbooks {
+            let contacts = self.list_contacts(&ab.href).await?;
+            if let Some(found) = contacts.into_iter().find(|c| contact_has_email(c, email)) {
+                return Ok(Some(found));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Get the first (default) address book href
     async fn default_addressbook(&self) -> Result<String> {
         let addressbooks = self.list_addressbooks().await?;
@@ -569,6 +584,19 @@ fn decode_qp(s: &str) -> String {
     }
     String::from_utf8(decoded_bytes)
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// Returns true iff the contact has an email matching `email` exactly,
+/// case-insensitively, ignoring surrounding whitespace on both sides.
+fn contact_has_email(contact: &Contact, email: &str) -> bool {
+    let target = email.trim().to_lowercase();
+    if target.is_empty() {
+        return false;
+    }
+    contact
+        .emails
+        .iter()
+        .any(|e| e.email.trim().to_lowercase() == target)
 }
 
 /// Parse a vCard string into a Contact
@@ -909,6 +937,60 @@ mod tests {
         assert_eq!(contact.organization, Some("Widgets Inc".to_string()));
         assert_eq!(contact.title, Some("CEO".to_string()));
         assert_eq!(contact.notes, Some("Important person".to_string()));
+    }
+
+    fn contact_with_emails(emails: &[&str]) -> Contact {
+        Contact {
+            id: "id".to_string(),
+            name: "Test".to_string(),
+            emails: emails
+                .iter()
+                .map(|e| ContactEmail {
+                    email: e.to_string(),
+                    label: None,
+                })
+                .collect(),
+            phones: vec![],
+            organization: None,
+            title: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn test_contact_has_email_case_insensitive() {
+        let c = contact_with_emails(&["Alice@Example.COM"]);
+        assert!(contact_has_email(&c, "alice@example.com"));
+        assert!(contact_has_email(&c, "ALICE@EXAMPLE.COM"));
+    }
+
+    #[test]
+    fn test_contact_has_email_multiple() {
+        let c = contact_with_emails(&["home@example.com", "work@example.com"]);
+        assert!(contact_has_email(&c, "work@example.com"));
+        assert!(contact_has_email(&c, "home@example.com"));
+    }
+
+    #[test]
+    fn test_contact_has_email_no_match() {
+        let c = contact_with_emails(&["alice@example.com"]);
+        assert!(!contact_has_email(&c, "bob@example.com"));
+        // substring is NOT a match (exact only)
+        assert!(!contact_has_email(&c, "example.com"));
+    }
+
+    #[test]
+    fn test_contact_has_email_whitespace_trimming() {
+        let c = contact_with_emails(&["  alice@example.com  "]);
+        assert!(contact_has_email(&c, "alice@example.com"));
+        assert!(contact_has_email(&c, "  alice@example.com  "));
+    }
+
+    #[test]
+    fn test_contact_has_email_empty_query() {
+        let c = contact_with_emails(&["alice@example.com"]);
+        assert!(!contact_has_email(&c, ""));
+        assert!(!contact_has_email(&c, "   "));
     }
 
     #[test]
