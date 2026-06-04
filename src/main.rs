@@ -1,3 +1,4 @@
+mod caldav;
 mod carddav;
 mod commands;
 mod config;
@@ -467,6 +468,14 @@ enum Commands {
     #[command(subcommand)]
     Contacts(ContactsCommands),
 
+    /// Manage calendars via CalDAV
+    #[command(subcommand)]
+    Calendar(CalendarCommands),
+
+    /// Manage calendar events via CalDAV
+    #[command(subcommand)]
+    Event(EventCommands),
+
     /// Delete emails: move to Trash, or permanently destroy with --hard
     /// (by id(s) or by search filter)
     Delete {
@@ -739,6 +748,55 @@ enum ContactsCommands {
         /// Skip confirmation
         #[arg(short = 'y', long)]
         yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CalendarCommands {
+    /// List calendars
+    List,
+}
+
+#[derive(Subcommand)]
+enum EventCommands {
+    /// Create a calendar event
+    Create {
+        /// Calendar name (case-insensitive; see `calendar list`)
+        #[arg(long)]
+        calendar: String,
+
+        /// Event title (SUMMARY)
+        #[arg(long)]
+        title: String,
+
+        /// Start: YYYY-MM-DDTHH:MM[:SS][Z] (no Z = floating local time), or
+        /// YYYY-MM-DD with --all-day
+        #[arg(long)]
+        start: String,
+
+        /// End, same format as --start (exclusive, per iCalendar)
+        #[arg(long, conflicts_with = "duration")]
+        end: Option<String>,
+
+        /// Duration, e.g. 1h, 90m, 1h30m, 2d (default: 1h timed, 1 day all-day)
+        #[arg(long)]
+        duration: Option<String>,
+
+        /// All-day event (--start/--end are plain dates)
+        #[arg(long)]
+        all_day: bool,
+
+        /// Location
+        #[arg(long)]
+        location: Option<String>,
+
+        /// Description/notes
+        #[arg(long)]
+        notes: Option<String>,
+
+        /// Recurrence rule, e.g. FREQ=WEEKLY;BYDAY=MO
+        #[arg(long)]
+        rrule: Option<String>,
     },
 }
 
@@ -1029,6 +1087,37 @@ async fn main() {
                     std::process::exit(1);
                 }
                 commands::delete_contact(&contact_id).await
+            }
+        },
+
+        Commands::Calendar(cmd) => match cmd {
+            CalendarCommands::List => commands::list_calendars().await,
+        },
+
+        Commands::Event(cmd) => match cmd {
+            EventCommands::Create {
+                calendar,
+                title,
+                start,
+                end,
+                duration,
+                all_day,
+                location,
+                notes,
+                rrule,
+            } => {
+                commands::create_event(
+                    &calendar,
+                    &title,
+                    &start,
+                    end.as_deref(),
+                    duration.as_deref(),
+                    all_day,
+                    location.as_deref(),
+                    notes.as_deref(),
+                    rrule.as_deref(),
+                )
+                .await
             }
         },
 

@@ -1,8 +1,10 @@
 mod auth;
 mod bulk;
+mod calendar;
 mod contacts;
 mod delete;
 mod download;
+mod event;
 mod export;
 mod flag;
 mod forward;
@@ -21,9 +23,11 @@ mod spam;
 mod thread;
 
 pub use auth::*;
+pub use calendar::*;
 pub use contacts::*;
 pub use delete::*;
 pub use download::*;
+pub use event::*;
 pub use export::*;
 pub use flag::*;
 pub use forward::*;

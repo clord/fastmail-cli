@@ -13,7 +13,8 @@ const CARDDAV_BASE: &str = "https://carddav.fastmail.com";
 
 // Per RFC 3986, these chars need escaping when interpolating into a URL path
 // segment. `/` is the segment delimiter and must be escaped to stay in-segment.
-const PATH_SEGMENT: &AsciiSet = &CONTROLS
+// Shared with the CalDAV module (same Fastmail WebDAV URL shape).
+pub(crate) const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
     .add(b'#')
