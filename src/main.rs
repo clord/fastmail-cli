@@ -395,12 +395,17 @@ enum Commands {
         draft: bool,
 
         /// HTML body content
-        #[arg(long, conflicts_with = "html_file")]
+        #[arg(long, conflicts_with = "html_file", conflicts_with = "markdown")]
         html_body: Option<String>,
 
         /// Path to HTML file for email body
-        #[arg(long, conflicts_with = "html_body")]
+        #[arg(long, conflicts_with = "html_body", conflicts_with = "markdown")]
         html_file: Option<String>,
+
+        /// Treat --body as Markdown: render it to HTML for the HTML body while
+        /// keeping the Markdown as the plain-text body.
+        #[arg(long, conflicts_with = "html_body", conflicts_with = "html_file")]
+        markdown: bool,
 
         /// File attachment (repeatable)
         #[arg(long = "attachment", short = 'a', action = clap::ArgAction::Append)]
@@ -447,6 +452,22 @@ enum Commands {
         /// File attachment (repeatable)
         #[arg(long = "attachment", short = 'a', action = clap::ArgAction::Append)]
         attachments: Vec<String>,
+    },
+
+    /// Watch the account for changes via JMAP push (Server-Sent Events).
+    /// Prints one StateChange JSON object per line; reconnects automatically.
+    Watch {
+        /// JMAP type(s) to watch, comma-separated (e.g. "Email,Mailbox") or "*"
+        #[arg(long, default_value = "Email")]
+        types: String,
+
+        /// Server ping interval in seconds (used for dead-connection detection)
+        #[arg(long, default_value = "300")]
+        ping: u32,
+
+        /// Exit after the first StateChange (for shell loops)
+        #[arg(long)]
+        once: bool,
     },
 
     /// Generate shell completions
@@ -942,9 +963,17 @@ async fn main() {
             draft,
             html_body,
             html_file,
+            markdown,
             attachments,
         } => {
             async {
+                // When --markdown is set, render the Markdown --body to HTML and
+                // use it as the HTML body; the Markdown stays as the text body.
+                let html_body = if markdown {
+                    Some(util::markdown_to_html(&body))
+                } else {
+                    html_body
+                };
                 let params = build_compose_params(
                     cc.as_deref(),
                     bcc.as_deref(),
@@ -958,6 +987,8 @@ async fn main() {
             }
             .await
         }
+
+        Commands::Watch { types, ping, once } => commands::watch(&types, ping, once).await,
 
         Commands::Forward {
             email_id,

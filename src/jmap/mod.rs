@@ -568,6 +568,96 @@ impl JmapClient {
         self.session.as_ref().ok_or(Error::NotAuthenticated)
     }
 
+    /// Resolve the JMAP push EventSource URL (RFC 8620 §7.3). The session's
+    /// `eventSourceUrl` is a URI template with `{types}`, `{closeafter}` and
+    /// `{ping}` variables; some servers advertise a plain URL instead, in
+    /// which case the parameters are appended as a query string.
+    pub fn push_url(&self, types: &str, ping: u32) -> Result<String> {
+        let template = self.session()?.event_source_url.clone().ok_or_else(|| {
+            Error::Config("Session has no eventSourceUrl; server does not support JMAP push".into())
+        })?;
+        if template.contains('{') {
+            Ok(template
+                .replace("{types}", types)
+                .replace("{closeafter}", "no")
+                .replace("{ping}", &ping.to_string()))
+        } else {
+            let sep = if template.contains('?') { '&' } else { '?' };
+            Ok(format!("{template}{sep}types={types}&closeafter=no&ping={ping}"))
+        }
+    }
+
+    /// Connect to the push EventSource stream and invoke `handler` with every
+    /// server-sent event's (name, data). A handler returning `true` stops the
+    /// stream cleanly (Ok). Errors on connection loss or on `idle` elapsing
+    /// with no traffic at all (server pings count as traffic).
+    pub async fn stream_events(
+        &self,
+        url: &str,
+        idle: Duration,
+        mut handler: impl FnMut(&str, &str) -> bool,
+    ) -> Result<()> {
+        use futures_util::StreamExt;
+
+        // The shared client has a whole-request timeout that would kill a
+        // long-lived stream; use a dedicated one with only a connect timeout.
+        let http = Client::builder().connect_timeout(TIMEOUT).build()?;
+        let resp = http
+            .get(url)
+            .bearer_auth(&self.token)
+            .header("Accept", "text/event-stream")
+            .send()
+            .await?;
+        match resp.status().as_u16() {
+            401 => return Err(Error::InvalidToken("Token expired or invalid")),
+            429 => return Err(Error::RateLimited),
+            s if s >= 400 => {
+                return Err(Error::Server(format!(
+                    "Push connect failed: {}",
+                    resp.status()
+                )));
+            }
+            _ => {}
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut event = String::new();
+        let mut data = String::new();
+        loop {
+            let chunk = match tokio::time::timeout(idle, stream.next()).await {
+                Err(_) => {
+                    return Err(Error::Server(format!(
+                        "Push stream idle for {}s (no server ping)",
+                        idle.as_secs()
+                    )));
+                }
+                Ok(None) => return Err(Error::Server("Push stream closed by server".into())),
+                Ok(Some(chunk)) => chunk?,
+            };
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let raw: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&raw);
+                let line = line.trim_end_matches(['\n', '\r']);
+                if line.is_empty() {
+                    // Blank line = dispatch the accumulated event.
+                    if !data.is_empty() && handler(&event, data.trim_end_matches('\n')) {
+                        return Ok(());
+                    }
+                    event.clear();
+                    data.clear();
+                } else if let Some(v) = line.strip_prefix("event:") {
+                    event = v.trim().to_string();
+                } else if let Some(v) = line.strip_prefix("data:") {
+                    data.push_str(v.strip_prefix(' ').unwrap_or(v));
+                    data.push('\n');
+                }
+                // id:/retry: fields and ":" comment lines are ignored.
+            }
+        }
+    }
+
     fn account_id(&self) -> Result<&str> {
         self.session()?
             .primary_account_id()
